@@ -654,8 +654,12 @@ func (c *baseClient) releaseConn(ctx context.Context, cn *pool.Conn, err error) 
 		c.connPool.Remove(ctx, cn, err)
 	} else {
 		// process any pending push notifications before returning the connection to the pool
-		if err := c.processPushNotifications(ctx, cn); err != nil {
-			internal.Logger.Printf(ctx, "push: error processing pending notifications before releasing connection: %v", err)
+		if pushErr := c.processPushNotifications(ctx, cn); pushErr != nil {
+			internal.Logger.Printf(ctx, "push: error processing pending notifications before releasing connection: %v", pushErr)
+			// The reader may hold a partially consumed push notification; the
+			// connection must not be reused in that state.
+			c.connPool.Remove(ctx, cn, pushErr)
+			return
 		}
 		c.connPool.Put(ctx, cn)
 	}
@@ -824,6 +828,9 @@ func (c *baseClient) _process(ctx context.Context, cmd Cmder, attempt int) (bool
 		// Process any pending push notifications before executing the command
 		if err := c.processPushNotifications(ctx, cn); err != nil {
 			internal.Logger.Printf(ctx, "push: error processing pending notifications before command: %v", err)
+			// The connection may hold a partially consumed push notification;
+			// fail the command so the connection is discarded and retried.
+			return err
 		}
 
 		if err := cn.WithWriter(c.context(ctx), c.opt.WriteTimeout, func(wr *proto.Writer) error {
@@ -1023,6 +1030,9 @@ func (c *baseClient) generalProcessPipeline(
 			// Process any pending push notifications before executing the pipeline
 			if err := c.processPushNotifications(ctx, cn); err != nil {
 				internal.Logger.Printf(ctx, "push: error processing pending notifications before processing pipeline: %v", err)
+				// The connection may hold a partially consumed push notification;
+				// fail the pipeline so the connection is discarded and retried.
+				return err
 			}
 			var err error
 			canRetry, err = p(ctx, cn, cmds)
@@ -1067,6 +1077,9 @@ func (c *baseClient) pipelineProcessCmds(
 	// Process any pending push notifications before executing the pipeline
 	if err := c.processPushNotifications(ctx, cn); err != nil {
 		internal.Logger.Printf(ctx, "push: error processing pending notifications before writing pipeline: %v", err)
+		// The connection may hold a partially consumed push notification;
+		// fail the pipeline so the connection is discarded and retried.
+		return true, err
 	}
 
 	if err := cn.WithWriter(c.context(ctx), c.opt.WriteTimeout, func(wr *proto.Writer) error {
@@ -1109,6 +1122,9 @@ func (c *baseClient) txPipelineProcessCmds(
 	// Process any pending push notifications before executing the transaction pipeline
 	if err := c.processPushNotifications(ctx, cn); err != nil {
 		internal.Logger.Printf(ctx, "push: error processing pending notifications before transaction: %v", err)
+		// The connection may hold a partially consumed push notification;
+		// fail the pipeline so the connection is discarded and retried.
+		return true, err
 	}
 
 	if err := cn.WithWriter(c.context(ctx), c.opt.WriteTimeout, func(wr *proto.Writer) error {
@@ -1596,10 +1612,13 @@ func (c *baseClient) processPushNotifications(ctx context.Context, cn *pool.Conn
 
 	// Use WithReader to access the reader and process push notifications
 	// This is critical for maintnotifications to work properly
-	// NOTE: almost no timeouts are set for this read, so it should not block
-	// longer than necessary, 10us should be plenty of time to read if there are any push notifications
-	// on the socket.
-	return cn.WithReader(ctx, 10*time.Microsecond, func(rd *proto.Reader) error {
+	// NOTE: use the regular reply timeout instead of a microsecond deadline:
+	// a push notification may be split across TCP segments, and aborting the
+	// read mid-notification leaves a partially consumed notification in the
+	// reader buffer, which is later parsed as a command reply (reply desync).
+	// MaybeHasData above guarantees bytes are present, so this normally
+	// completes as soon as the remaining bytes arrive.
+	return cn.WithReader(ctx, c.opt.ReadTimeout, func(rd *proto.Reader) error {
 		// Create handler context with client, connection pool, and connection information
 		handlerCtx := c.pushNotificationHandlerContext(cn)
 		return c.pushProcessor.ProcessPendingNotifications(ctx, handlerCtx, rd)
